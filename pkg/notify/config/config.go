@@ -163,14 +163,11 @@ func newClient(cfg *rest.Config, cache cache.Cache, scheme *runtime.Scheme) (cli
 		return nil, err
 	}
 
-	return &client.DelegatingClient{
-		Reader: &client.DelegatingReader{
-			CacheReader:  cache,
-			ClientReader: c,
-		},
-		Writer:       c,
-		StatusClient: c,
-	}, nil
+	return client.NewDelegatingClient(
+		client.NewDelegatingClientInput{
+			CacheReader: cache,
+			Client:      c,
+		})
 }
 
 func (c *Config) Run() error {
@@ -188,11 +185,11 @@ func (c *Config) Run() error {
 		}
 	}(c.ctx)
 	go func() {
-		_ = c.cache.Start(c.ctx.Done())
+		_ = c.cache.Start(c.ctx)
 	}()
 
 	// Setup informer for NotificationManager
-	nmInf, err := c.cache.GetInformer(&v2beta2.NotificationManager{})
+	nmInf, err := c.cache.GetInformer(c.ctx, &v2beta2.NotificationManager{})
 	if err != nil {
 		_ = level.Error(c.logger).Log("msg", "Failed to get informer for NotificationManager", "err", err)
 		return err
@@ -205,7 +202,7 @@ func (c *Config) Run() error {
 		DeleteFunc: c.onNmDel,
 	})
 
-	receiverInformer, err := c.cache.GetInformer(&v2beta2.Receiver{})
+	receiverInformer, err := c.cache.GetInformer(c.ctx, &v2beta2.Receiver{})
 	if err != nil {
 		_ = level.Error(c.logger).Log("msg", "Failed to get receiver informer", "err", err)
 		return err
@@ -222,7 +219,7 @@ func (c *Config) Run() error {
 		},
 	})
 
-	configInformer, err := c.cache.GetInformer(&v2beta2.Config{})
+	configInformer, err := c.cache.GetInformer(c.ctx, &v2beta2.Config{})
 	if err != nil {
 		_ = level.Error(c.logger).Log("msg", "Failed to get config informer", "err", err)
 		return err
@@ -239,7 +236,7 @@ func (c *Config) Run() error {
 		},
 	})
 
-	if ok := c.cache.WaitForCacheSync(c.ctx.Done()); !ok {
+	if ok := c.cache.WaitForCacheSync(c.ctx); !ok {
 		return fmt.Errorf("NotificationManager cache failed")
 	}
 
