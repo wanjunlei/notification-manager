@@ -14,6 +14,7 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	json "github.com/json-iterator/go"
+
 	"github.com/kubesphere/notification-manager/pkg/utils"
 )
 
@@ -290,6 +291,7 @@ func (t *Template) Split(data *Data, maxSize int, templateName string, subjectTe
 			continue
 		}
 
+		d.Alerts = d.Alerts[:len(d.Alerts)-1]
 		output = append(output, &DataSlice{
 			Data:    d,
 			Message: lastMsg,
