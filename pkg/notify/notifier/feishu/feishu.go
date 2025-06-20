@@ -8,12 +8,15 @@ import (
 	"encoding/base64"
 	"fmt"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	json "github.com/json-iterator/go"
+
 	"github.com/kubesphere/notification-manager/pkg/async"
 	"github.com/kubesphere/notification-manager/pkg/constants"
 	"github.com/kubesphere/notification-manager/pkg/controller"
@@ -32,6 +35,10 @@ const (
 	DefaultTextTemplate = `{{ template "nm.feishu.text" . }}`
 	DefaultExpires      = time.Hour * 2
 	ExceedLimitCode     = 9499
+
+	ConversationTextMessageMaxSize = 150 * 1024
+	ConversationPostMessageMaxSize = 30 * 1024
+	ChatbotMessageMaxSize          = 20 * 1024
 )
 
 type Notifier struct {
@@ -42,6 +49,10 @@ type Notifier struct {
 	tmpl         *template.Template
 	ats          *notifier.AccessTokenService
 	tokenExpires time.Duration
+
+	conversationTextMessageMaxSize int
+	conversationPostMessageMaxSize int
+	chatbotMessageMaxSize          int
 
 	sentSuccessfulHandler *func([]*template.Alert)
 }
@@ -76,11 +87,14 @@ type responseData struct {
 func NewFeishuNotifier(logger log.Logger, receiver internal.Receiver, notifierCtl *controller.Controller) (notifier.Notifier, error) {
 
 	n := &Notifier{
-		notifierCtl:  notifierCtl,
-		logger:       logger,
-		timeout:      DefaultSendTimeout,
-		ats:          notifier.GetAccessTokenService(),
-		tokenExpires: DefaultExpires,
+		notifierCtl:                    notifierCtl,
+		logger:                         logger,
+		timeout:                        DefaultSendTimeout,
+		ats:                            notifier.GetAccessTokenService(),
+		tokenExpires:                   DefaultExpires,
+		conversationTextMessageMaxSize: ConversationTextMessageMaxSize,
+		conversationPostMessageMaxSize: ConversationPostMessageMaxSize,
+		chatbotMessageMaxSize:          ChatbotMessageMaxSize,
 	}
 
 	opts := notifierCtl.ReceiverOpts
@@ -133,6 +147,35 @@ func NewFeishuNotifier(logger log.Logger, receiver internal.Receiver, notifierCt
 		return nil, err
 	}
 
+	// A temporary solution is used to set the max length of the message.
+	// These settings will be placed in the crd later.
+	if v := os.Getenv("CONVERSATION_TEXT_MESSAGE_MAX_SIZE"); v != "" {
+		size, err := strconv.Atoi(v)
+		if err != nil {
+			_ = level.Warn(n.logger).Log("msg", "FeishuNotifier: CONVERSATION_TEXT_MESSAGE_MAX_SIZE is invalid, use default", "error", err.Error())
+		} else {
+			n.conversationTextMessageMaxSize = size
+		}
+	}
+
+	if v := os.Getenv("CONVERSATION_POST_MESSAGE_MAX_SIZE"); v != "" {
+		size, err := strconv.Atoi(v)
+		if err != nil {
+			_ = level.Warn(n.logger).Log("msg", "FeishuNotifier: CONVERSATION_POST_MESSAGE_MAX_SIZE is invalid, use default", "error", err.Error())
+		} else {
+			n.conversationPostMessageMaxSize = size
+		}
+	}
+
+	if v := os.Getenv("CHATBOT_MESSAGE_MAX_SIZE"); v != "" {
+		size, err := strconv.Atoi(v)
+		if err != nil {
+			_ = level.Warn(n.logger).Log("msg", "FeishuNotifier: CHATBOT_MESSAGE_MAX_SIZE is invalid, use default", "error", err.Error())
+		} else {
+			n.chatbotMessageMaxSize = size
+		}
+	}
+
 	return n, nil
 }
 
@@ -141,100 +184,43 @@ func (n *Notifier) SetSentSuccessfulHandler(h *func([]*template.Alert)) {
 }
 
 func (n *Notifier) Notify(ctx context.Context, data *template.Data) error {
-	content, err := n.tmpl.Text(n.receiver.TmplName, data)
-	if err != nil {
-		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: generate message error", "error", err.Error())
-		return err
-	}
-
 	group := async.NewGroup(ctx)
 	if n.receiver.ChatBot != nil {
 		group.Add(func(stopCh chan interface{}) {
-			err := n.sendToChatBot(ctx, content)
-			if err == nil {
-				if n.sentSuccessfulHandler != nil {
-					(*n.sentSuccessfulHandler)(data.Alerts)
-				}
-			}
-			stopCh <- err
+			stopCh <- n.sendToChatBot(ctx, data)
 		})
 	}
 
 	if len(n.receiver.User) > 0 || len(n.receiver.Department) > 0 {
 		group.Add(func(stopCh chan interface{}) {
-			err := n.batchSend(ctx, content)
-			if err == nil {
-				if n.sentSuccessfulHandler != nil {
-					(*n.sentSuccessfulHandler)(data.Alerts)
-				}
-			}
-			stopCh <- err
+			stopCh <- n.batchSend(ctx, data)
 		})
 	}
 
 	return group.Wait()
 }
 
-func (n *Notifier) sendToChatBot(ctx context.Context, content string) error {
-	keywords := ""
-	if len(n.receiver.ChatBot.Keywords) != 0 {
-		keywords = fmt.Sprintf("[Keywords] %s", utils.ArrayToString(n.receiver.ChatBot.Keywords, ","))
+func (n *Notifier) sendToChatBot(ctx context.Context, data *template.Data) error {
+	webhook, err := n.notifierCtl.GetCredential(n.receiver.ChatBot.Webhook)
+	if err != nil {
+		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: get webhook secret error", "error", err.Error())
+		return err
 	}
 
-	message := &Message{MsgType: n.receiver.TmplType}
-	if n.receiver.TmplType == constants.Post {
-		post := make(map[string]interface{})
-		if err := json.Unmarshal([]byte(content), &post); err != nil {
-			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unmarshal failed", "error", err)
-			return err
-		}
-
-		if len(keywords) > 0 {
-			for k, v := range post {
-				p := v.(map[string]interface{})
-				items := p["content"].([]interface{})
-				items = append(items, []interface{}{
-					map[string]string{
-						"tag":  "text",
-						"text": keywords,
-					},
-				})
-				p["content"] = items
-				post[k] = p
-			}
-		}
-
-		message.Content.Post = post
-	} else if n.receiver.TmplType == constants.Text {
-		message.Content.Text = content
-		if len(keywords) > 0 {
-			message.Content.Text = fmt.Sprintf("%s\n\n%s", content, keywords)
-		}
-	} else {
-		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unknown message type", "type", n.receiver.TmplType)
-		return utils.Errorf("Unknown message type, %s", n.receiver.TmplType)
-	}
-
+	secret := ""
 	if n.receiver.ChatBot.Secret != nil {
-		secret, err := n.notifierCtl.GetCredential(n.receiver.ChatBot.Secret)
+		secret, err = n.notifierCtl.GetCredential(n.receiver.ChatBot.Secret)
 		if err != nil {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: get secret error", "error", err.Error())
 			return err
 		}
-
-		message.Timestamp = time.Now().Unix()
-		message.Sign, err = genSign(secret, message.Timestamp)
-		if err != nil {
-			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: calculate signature error", "error", err.Error())
-			return err
-		}
 	}
 
-	send := func() (bool, error) {
-		webhook, err := n.notifierCtl.GetCredential(n.receiver.ChatBot.Webhook)
-		if err != nil {
-			return false, err
-		}
+	send := func(message *Message) (bool, error) {
+		start := time.Now()
+		defer func() {
+			_ = level.Debug(n.logger).Log("msg", "FeishuNotifier: send message to chatbot", "used", time.Since(start).String())
+		}()
 
 		var buf bytes.Buffer
 		if err := utils.JsonEncode(&buf, message); err != nil {
@@ -269,51 +255,113 @@ func (n *Notifier) sendToChatBot(ctx context.Context, content string) error {
 		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
 	}
 
-	start := time.Now()
-	defer func() {
-		_ = level.Debug(n.logger).Log("msg", "FeishuNotifier: send message to chatbot", "used", time.Since(start).String())
-	}()
+	keywords := ""
+	if len(n.receiver.ChatBot.Keywords) != 0 {
+		keywords = fmt.Sprintf("\n\n[Keywords] %s", utils.ArrayToString(n.receiver.ChatBot.Keywords, ","))
+	}
 
-	retry := 0
-	// The retries will continue until the send times out and the context is cancelled.
-	// There is only one case that triggers the retry mechanism, that is, the API call exceeds the limit.
-	// The maximum frequency for sending notifications to chatbot is 5 times/second and 100 times/minute.
-	for {
-		needRetry, err := send()
-		if err != nil {
-			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification to chatbot error", "error", err.Error())
+	maxSize := n.chatbotMessageMaxSize
+	if len(keywords) > 0 {
+		if n.receiver.TmplType == constants.Post {
+			maxSize = int(float32(maxSize) * 0.8)
+		} else {
+			maxSize = maxSize - len(keywords)
 		}
-		if needRetry {
-			retry = retry + 1
-			time.Sleep(time.Second)
-			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send notification to chatbot", "retry", retry)
-			continue
-		}
+	}
 
+	splitData, err := n.tmpl.Split(data, maxSize, n.receiver.TmplName, "", n.logger)
+	if err != nil {
+		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: split message error", "error", err.Error())
 		return err
 	}
-}
 
-func (n *Notifier) batchSend(ctx context.Context, content string) error {
-	message := &Message{MsgType: n.receiver.TmplType}
-	if n.receiver.TmplType == constants.Post {
-		post := make(map[string]interface{})
-		if err := json.Unmarshal([]byte(content), &post); err != nil {
-			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unmarshal failed", "error", err)
-			return err
+	group := async.NewGroup(ctx)
+	for index := range splitData {
+		d := splitData[index]
+		alerts := d.Alerts
+		message := &Message{MsgType: n.receiver.TmplType}
+		if n.receiver.TmplType == constants.Post {
+			post := make(map[string]interface{})
+			if err := json.Unmarshal([]byte(d.Message), &post); err != nil {
+				_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unmarshal failed", "error", err)
+				return err
+			}
+
+			if len(keywords) > 0 {
+				for k, v := range post {
+					p := v.(map[string]interface{})
+					items := p["content"].([]interface{})
+					items = append(items, []interface{}{
+						map[string]string{
+							"tag":  "text",
+							"text": keywords,
+						},
+					})
+					p["content"] = items
+					post[k] = p
+				}
+			}
+
+			message.Content.Post = post
+		} else if n.receiver.TmplType == constants.Text {
+			message.Content.Text = d.Message
+			if len(keywords) > 0 {
+				message.Content.Text = fmt.Sprintf("%s%s", d.Message, keywords)
+			}
+		} else {
+			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unknown message type", "type", n.receiver.TmplType)
+			return utils.Errorf("Unknown message type, %s", n.receiver.TmplType)
 		}
-		message.Content.Post = post
-	} else if n.receiver.TmplType == constants.Text {
-		message.Content.Text = content
-	} else {
-		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unknown message type", "type", n.receiver.TmplType)
-		return utils.Errorf("Unknown message type, %s", n.receiver.TmplType)
+
+		if secret != "" {
+			message.Timestamp = time.Now().Unix()
+			message.Sign, err = genSign(secret, message.Timestamp)
+			if err != nil {
+				_ = level.Error(n.logger).Log("msg", "FeishuNotifier: calculate signature error", "error", err.Error())
+				return err
+			}
+		}
+
+		group.Add(func(stopCh chan interface{}) {
+			retry := 0
+			// The retries will continue until times out and the context is canceled.
+			// There is only one case that triggers the retry mechanism, that is, the API call exceeds the limit.
+			// The maximum frequency for sending notifications to chatbot is 5 times/second and 100 times/minute.
+			for {
+				needRetry, err := send(message)
+				if err != nil {
+					_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification to chatbot error", "error", err.Error())
+				} else {
+					if n.sentSuccessfulHandler != nil {
+						(*n.sentSuccessfulHandler)(alerts)
+					}
+				}
+
+				if needRetry {
+					retry = retry + 1
+					time.Sleep(time.Second)
+					_ = level.Warn(n.logger).Log("msg", "FeishuNotifier: retry to send notification to chatbot", "retry", retry)
+					continue
+				}
+
+				stopCh <- err
+				return
+			}
+		})
 	}
 
-	message.User = n.receiver.User
-	message.Department = n.receiver.Department
+	return group.Wait()
+}
 
-	send := func(retry int) (bool, error) {
+func (n *Notifier) batchSend(ctx context.Context, data *template.Data) error {
+	send := func(message *Message) (bool, error) {
+		start := time.Now()
+		defer func() {
+			_ = level.Debug(n.logger).Log("msg", "FeishuNotifier: send message", "used", time.Since(start).String(),
+				"user", utils.ArrayToString(n.receiver.User, ","),
+				"department", utils.ArrayToString(n.receiver.Department, ","))
+		}()
+
 		if n.receiver.Config == nil {
 			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: config is nil")
 			return false, utils.Error("FeishuNotifier: config is nil")
@@ -328,7 +376,7 @@ func (n *Notifier) batchSend(ctx context.Context, content string) error {
 		if err := utils.JsonEncode(&buf, message); err != nil {
 			return false, err
 		}
-
+		_ = level.Info(n.logger).Log("content len ", buf.Len())
 		request, err := http.NewRequest(http.MethodPost, BatchAPI, &buf)
 		if err != nil {
 			return false, err
@@ -370,31 +418,69 @@ func (n *Notifier) batchSend(ctx context.Context, content string) error {
 		return false, utils.Errorf("%d, %s", resp.Code, resp.Msg)
 	}
 
-	start := time.Now()
-	defer func() {
-		_ = level.Debug(n.logger).Log("msg", "FeishuNotifier: send message", "used", time.Since(start).String(),
-			"user", utils.ArrayToString(n.receiver.User, ","),
-			"department", utils.ArrayToString(n.receiver.Department, ","))
-	}()
+	maxSize := n.conversationTextMessageMaxSize
+	if n.receiver.TmplType == constants.Post {
+		maxSize = n.conversationPostMessageMaxSize
+	}
 
-	retry := 0
-	// The retries will continue until the send times out and the context is cancelled.
-	// There is only one case that triggers the retry mechanism, that is, the API call exceeds the limit.
-	// The maximum frequency for sending notifications to the same user is 5 times/second.
-	for {
-		needRetry, err := send(retry)
-		if err != nil {
-			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification error", "error", err, "retry", retry)
-		}
-		if needRetry {
-			retry = retry + 1
-			time.Sleep(time.Second)
-			_ = level.Info(n.logger).Log("msg", "FeishuNotifier: retry to send notification", "retry", retry)
-			continue
-		}
-
+	splitData, err := n.tmpl.Split(data, maxSize, n.receiver.TmplName, "", n.logger)
+	if err != nil {
+		_ = level.Error(n.logger).Log("msg", "FeishuNotifier: split message error", "error", err.Error())
 		return err
 	}
+
+	group := async.NewGroup(ctx)
+	for index := range splitData {
+		d := splitData[index]
+		alerts := d.Alerts
+		message := &Message{
+			MsgType:    n.receiver.TmplType,
+			User:       n.receiver.User,
+			Department: n.receiver.Department,
+		}
+		if n.receiver.TmplType == constants.Post {
+			post := make(map[string]interface{})
+			if err := json.Unmarshal([]byte(d.Message), &post); err != nil {
+				_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unmarshal failed", "error", err)
+				return err
+			}
+			message.Content.Post = post
+		} else if n.receiver.TmplType == constants.Text {
+			message.Content.Text = d.Message
+		} else {
+			_ = level.Error(n.logger).Log("msg", "FeishuNotifier: unknown message type", "type", n.receiver.TmplType)
+			return utils.Errorf("Unknown message type, %s", n.receiver.TmplType)
+		}
+
+		group.Add(func(stopCh chan interface{}) {
+			retry := 0
+			// The retries will continue until times out and the context is canceled.
+			// There is only one case that triggers the retry mechanism, that is, the API call exceeds the limit.
+			// The maximum frequency for sending notifications to chatbot is 5 times/second and 100 times/minute.
+			for {
+				needRetry, err := send(message)
+				if err != nil {
+					_ = level.Error(n.logger).Log("msg", "FeishuNotifier: send notification error", "error", err, "retry", retry)
+				} else {
+					if n.sentSuccessfulHandler != nil {
+						(*n.sentSuccessfulHandler)(alerts)
+					}
+				}
+
+				if needRetry {
+					retry = retry + 1
+					time.Sleep(time.Second)
+					_ = level.Warn(n.logger).Log("msg", "FeishuNotifier: retry to send notification", "retry", retry)
+					continue
+				}
+
+				stopCh <- err
+				return
+			}
+		})
+	}
+
+	return group.Wait()
 }
 
 func (n *Notifier) getToken(ctx context.Context, r *feishu.Receiver) (string, error) {
